@@ -12,14 +12,21 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ChatPermissions,
 )
+
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from sqlalchemy import select, func, desc
 
 from .config import BOT_TOKEN, ADMIN_ID, TARGET_CHAT_ID
-from .db import Session, Event, Appeal
-from .policy import RULES, format_rule
+
+from .db import Session, Event, Appeal, Penalty
+from .policy import (
+    RULES,
+    format_rule,
+    get_penalty_options,
+)
 
 
 # ==========================================
@@ -76,6 +83,11 @@ def is_admin(message: Message) -> bool:
         message.from_user
         and is_admin_id(message.from_user.id)
     )
+    EVENT_RULES = {
+    "flood_suspected": "2.2",
+    "spam_suspected": "2.3",
+    "caps_suspected": "2.4",
+    }
 
 
 def user_menu():
@@ -113,6 +125,18 @@ def admin_menu():
     builder.adjust(1)
     return builder.as_markup()
 
+def penalty_keyboard(event_id, rule_id):
+    options = get_penalty_options(rule_id)
+    builder = InlineKeyboardBuilder()
+
+    for index, option in enumerate(options):
+        builder.button(
+            text=option["label"],
+            callback_data=f"penalty_pick:{event_id}:{index}"
+        )
+
+    builder.adjust(1)
+    return builder.as_markup()
 
 def normalize_text(text: str) -> str:
     text = text.lower()
@@ -906,13 +930,70 @@ async def process_review_decision(
     )
 
 
-@dp.message(Command("confirm"), F.chat.type == "private")
-async def confirm(message: Message, command: CommandObject):
-    await process_review_decision(
-        message, command,
-        "review_confirmed",
-        "Подозрение подтверждено"
-    )
+@dp.message(Command("confirm"))
+async def confirm_event(message: Message, command: CommandObject):
+    if not await is_admin(message):
+        return
+
+    if not command.args:
+        await message.answer("Использование: /confirm ID_СОБЫТИЯ")
+        return
+
+    try:
+        event_id = int(command.args.strip())
+    except ValueError:
+        await message.answer("ID события должен быть числом.")
+        return
+
+    async with Session() as session:
+        event = await session.get(Event, event_id)
+
+        if not event:
+            await message.answer("Событие не найдено.")
+            return
+
+        rule_id = EVENT_RULES.get(event.event_type)
+
+        if not rule_id:
+            await message.answer(
+                "Для этого типа события пока нет доступного выбора наказания."
+            )
+            return
+
+        existing = await session.scalar(
+            select(Event).where(
+                Event.event_type == "review_confirmed",
+                Event.details.contains(f"event_id={event_id}")
+            )
+        )
+
+        if existing:
+            await message.answer("Это событие уже подтверждено.")
+            return
+
+        dismissed = await session.scalar(
+            select(Event).where(
+                Event.event_type == "review_dismissed",
+                Event.details.contains(f"event_id={event_id}")
+            )
+        )
+
+        if dismissed:
+            await message.answer("Это событие уже отклонено.")
+            return
+
+        options = get_penalty_options(rule_id)
+
+        if not options:
+            await message.answer("Для правила нет вариантов наказания.")
+            return
+
+        await message.answer(
+            f"Событие #{event_id}\n"
+            f"Правило: {rule_id}\n"
+            "Выбери вариант решения:",
+            reply_markup=penalty_keyboard(event_id, rule_id)
+        )
 
 
 @dp.message(Command("dismiss"), F.chat.type == "private")

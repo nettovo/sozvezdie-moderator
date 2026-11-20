@@ -1,6 +1,12 @@
 import hashlib
 import re
 
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import CommandStart
+from sqlalchemy import select
+from .policy import RULES, format_rule
+
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -17,6 +23,21 @@ from .db import Session, Event
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+def user_menu():
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="📋 Мои наказания",
+        callback_data="my_penalties"
+    )
+    builder.button(
+        text="✉️ Связаться с администрацией",
+        callback_data="contact_admin"
+    )
+
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 # ==========================================

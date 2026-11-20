@@ -11,6 +11,7 @@ from .db import Session, Event
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+# Настройки обнаружения флуда
 FLOOD_LIMIT = 5
 FLOOD_WINDOW_SECONDS = 10
 
@@ -25,16 +26,23 @@ def is_admin(message: Message) -> bool:
 @dp.message(Command("start"), F.chat.type == "private")
 async def start(message: Message):
     await message.answer(
-        "Модератор «Созвездия» запущен в тестовом режиме.\n"
+        "Модератор «Созвездия» запущен.\n"
+        "Режим: наблюдение.\n"
         "Автоматические наказания отключены."
     )
 
 
 @dp.message(Command("id"))
 async def show_id(message: Message):
-    user_id = message.from_user.id if message.from_user else "не определён"
+    user_id = (
+        message.from_user.id
+        if message.from_user
+        else "не определён"
+    )
+
     await message.answer(
-        f"ID чата: {message.chat.id}\nВаш ID: {user_id}"
+        f"ID чата: {message.chat.id}\n"
+        f"Ваш ID: {user_id}"
     )
 
 
@@ -47,7 +55,9 @@ async def panel(message: Message):
     await message.answer(
         "ПАНЕЛЬ МОДЕРАТОРА «СОЗВЕЗДИЕ»\n\n"
         "/stats — статистика событий\n"
-        "/events — последние события\n\n"
+        "/events — последние события\n"
+        "/review — очередь проверки\n"
+        "/id — узнать ID\n\n"
         "Режим: наблюдение.\n"
         "Автоматические наказания отключены."
     )
@@ -65,11 +75,13 @@ async def stats(message: Message):
                 Event.chat_id == TARGET_CHAT_ID
             )
         )
+
         users = await session.scalar(
             select(func.count(func.distinct(Event.user_id))).where(
                 Event.chat_id == TARGET_CHAT_ID
             )
         )
+
         flood = await session.scalar(
             select(func.count(Event.id)).where(
                 Event.chat_id == TARGET_CHAT_ID,
@@ -77,11 +89,27 @@ async def stats(message: Message):
             )
         )
 
+        spam = await session.scalar(
+            select(func.count(Event.id)).where(
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type == "spam_suspected"
+            )
+        )
+
+        caps = await session.scalar(
+            select(func.count(Event.id)).where(
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type == "caps_suspected"
+            )
+        )
+
     await message.answer(
         "СТАТИСТИКА «СОЗВЕЗДИЯ»\n\n"
         f"Зарегистрировано событий: {total or 0}\n"
-        f"Участников в журнале: {users or 0}\n"
+        f"Участников в журнале: {users or 0}\n\n"
         f"Подозрений на флуд: {flood or 0}\n"
+        f"Подозрений на спам: {spam or 0}\n"
+        f"Подозрений на CAPS: {caps or 0}\n\n"
         "Автоматические наказания: выключены."
     )
 
@@ -97,15 +125,17 @@ async def events(message: Message):
             select(Event)
             .where(Event.chat_id == TARGET_CHAT_ID)
             .order_by(desc(Event.id))
-            .limit(5)
+            .limit(10)
         )
+
         rows = result.all()
 
     if not rows:
         await message.answer("Пока событий в журнале нет.")
         return
 
-    lines = ["ПОСЛЕДНИЕ СОБЫТИЯ:"]
+    lines = ["ПОСЛЕДНИЕ СОБЫТИЯ:\n"]
+
     for event in rows:
         lines.append(
             f"ID записи: {event.id}\n"
@@ -113,6 +143,54 @@ async def events(message: Message):
             f"Тип: {event.event_type}\n"
             f"Причина: {event.details}\n"
         )
+
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("review"), F.chat.type == "private")
+async def review(message: Message):
+    if not is_admin(message):
+        await message.answer("Нет доступа.")
+        return
+
+    async with Session() as session:
+        result = await session.scalars(
+            select(Event)
+            .where(
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type.in_([
+                    "flood_suspected",
+                    "spam_suspected",
+                    "caps_suspected"
+                ])
+            )
+            .order_by(desc(Event.id))
+            .limit(10)
+        )
+
+        rows = result.all()
+
+    if not rows:
+        await message.answer(
+            "Очередь проверки пуста.\n"
+            "Подозрительных событий пока нет."
+        )
+        return
+
+    lines = ["СОБЫТИЯ ДЛЯ ПРОВЕРКИ:\n"]
+
+    for event in rows:
+        lines.append(
+            f"Запись: {event.id}\n"
+            f"Участник: {event.user_id}\n"
+            f"Тип: {event.event_type}\n"
+            f"Причина: {event.details}\n"
+        )
+
+    lines.append(
+        "Это только подозрения. "
+        "Решение принимает администрация."
+    )
 
     await message.answer("\n".join(lines))
 
@@ -127,6 +205,7 @@ async def observe(message: Message):
         return
 
     async with Session() as session:
+        # Регистрируем обычное сообщение
         session.add(
             Event(
                 chat_id=message.chat.id,
@@ -136,8 +215,10 @@ async def observe(message: Message):
                 details="Текст сообщения не сохраняется."
             )
         )
+
         await session.commit()
 
+        # Проверяем количество сообщений за заданный период
         cutoff = datetime.now(timezone.utc) - timedelta(
             seconds=FLOOD_WINDOW_SECONDS
         )
@@ -151,6 +232,7 @@ async def observe(message: Message):
             )
         )
 
+        # Создаём событие при достижении порога
         if recent_count == FLOOD_LIMIT:
             session.add(
                 Event(
@@ -165,4 +247,5 @@ async def observe(message: Message):
                     )
                 )
             )
+
             await session.commit()

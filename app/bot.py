@@ -20,7 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select, func, desc
 
 from .config import BOT_TOKEN, ADMIN_ID, TARGET_CHAT_ID
-from .db import Session, Event, Appeal, Penalty
+from .db import Session, Event, Appeal, Penalty, RuleAcceptance
 from .policy import RULES, format_rule, get_penalty_options
 
 
@@ -96,16 +96,42 @@ def ensure_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def user_rules_keyboard():
+    """Кнопки для просмотра отдельных пунктов правил."""
+    builder = InlineKeyboardBuilder()
+
+    for rule_id, rule in RULES.items():
+        builder.button(
+            text=f"{rule_id} — {rule['title']}",
+            callback_data=f"user_rule:{rule_id}",
+        )
+
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def user_menu():
     builder = InlineKeyboardBuilder()
 
     builder.button(
         text="📋 Мои наказания",
-        callback_data="my_penalties"
+        callback_data="my_penalties",
+    )
+    builder.button(
+        text="📨 Мои обращения",
+        callback_data="my_appeals",
+    )
+    builder.button(
+        text="📚 Правила сообщества",
+        callback_data="user_rules",
+    )
+    builder.button(
+        text="✅ Подтвердить ознакомление с правилами",
+        callback_data="accept_rules",
     )
     builder.button(
         text="✉️ Подать обращение",
-        callback_data="contact_admin"
+        callback_data="contact_admin",
     )
 
     builder.adjust(1)
@@ -117,15 +143,15 @@ def admin_menu():
 
     builder.button(
         text="📊 Статистика",
-        callback_data="admin_stats"
+        callback_data="admin_stats",
     )
     builder.button(
         text="📋 Последние события",
-        callback_data="admin_events"
+        callback_data="admin_events",
     )
     builder.button(
         text="🔎 Очередь проверки",
-        callback_data="admin_review"
+        callback_data="admin_review",
     )
 
     builder.adjust(1)
@@ -139,7 +165,7 @@ def penalty_keyboard(event_id, rule_id):
     for index, option in enumerate(options):
         builder.button(
             text=option["label"],
-            callback_data=f"penalty_pick:{event_id}:{index}"
+            callback_data=f"penalty_pick:{event_id}:{index}",
         )
 
     builder.adjust(1)
@@ -221,7 +247,7 @@ async def get_review_decision(session, event_id):
 
         match = re.search(
             r"(?:^|[; ])event_id=(\d+)",
-            decision.details
+            decision.details,
         )
 
         if match and int(match.group(1)) == event_id:
@@ -273,16 +299,18 @@ async def start(message: Message):
         "«Созвездие»!\n\n"
         "Здесь ты можешь:\n"
         "📋 Посмотреть информацию о наказаниях.\n"
+        "📨 Посмотреть свои обращения.\n"
+        "📚 Ознакомиться с правилами сообщества.\n"
+        "✅ Подтвердить ознакомление с правилами.\n"
         "✉️ Обратиться к администрации.\n\n"
-        "Если ты получил наказание, подробности "
-        "можно узнать здесь.",
-        reply_markup=user_menu()
+        "Выбери нужный раздел:",
+        reply_markup=user_menu(),
     )
 
     if is_admin(message):
         await message.answer(
             "Панель администратора:",
-            reply_markup=admin_menu()
+            reply_markup=admin_menu(),
         )
 
 
@@ -319,7 +347,13 @@ async def my_penalties(callback: CallbackQuery):
             ):
                 penalty.status = "completed"
 
-            if penalty.status == "issued" and penalty.expires_at is not None:
+            if (
+                penalty.status == "issued"
+                and (
+                    penalty.expires_at is None
+                    or ensure_utc(penalty.expires_at) > now
+                )
+            ):
                 active.append(penalty)
             else:
                 history.append(penalty)
@@ -368,6 +402,138 @@ async def my_penalties(callback: CallbackQuery):
 
     await callback.message.answer("\n".join(lines))
     await callback.answer()
+
+
+# ==========================================
+# МОИ ОБРАЩЕНИЯ
+# ==========================================
+
+@dp.callback_query(F.data == "my_appeals")
+async def my_appeals(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    async with Session() as session:
+        result = await session.scalars(
+            select(Appeal)
+            .where(Appeal.user_id == user_id)
+            .order_by(desc(Appeal.created_at))
+            .limit(20)
+        )
+
+        rows = result.all()
+
+    if not rows:
+        await callback.message.answer(
+            "У тебя пока нет обращений к администрации."
+        )
+        await callback.answer()
+        return
+
+    lines = ["📨 ТВОИ ОБРАЩЕНИЯ\n"]
+
+    for appeal in rows:
+        if appeal.status == "pending":
+            status = "Ожидает рассмотрения"
+        elif appeal.status == "reviewed":
+            status = "Рассмотрено"
+        else:
+            status = appeal.status
+
+        lines.append(
+            f"Обращение №{appeal.id}\n"
+            f"Статус: {status}\n"
+            f"Дата: {ensure_utc(appeal.created_at).strftime('%d.%m.%Y %H:%M UTC')}\n"
+            f"Текст: {appeal.text[:500]}\n"
+        )
+
+    await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+# ==========================================
+# ПРАВИЛА: СПИСОК И ПРОСМОТР ПУНКТОВ
+# ==========================================
+
+@dp.callback_query(F.data == "user_rules")
+async def user_rules_button(callback: CallbackQuery):
+    await callback.message.answer(
+        "📚 ПРАВИЛА СООБЩЕСТВА «СОЗВЕЗДИЕ»\n\n"
+        "Выбери пункт, чтобы прочитать его:",
+        reply_markup=user_rules_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("user_rule:"))
+async def user_rule_button(callback: CallbackQuery):
+    rule_id = callback.data.split(":", 1)[1]
+
+    if rule_id not in RULES:
+        await callback.answer(
+            "Пункт правил не найден.",
+            show_alert=True,
+        )
+        return
+
+    await callback.message.answer(format_rule(rule_id))
+    await callback.answer()
+
+
+@dp.message(Command("rules"), F.chat.type == "private")
+async def show_rules(message: Message):
+    await message.answer(
+        "📚 ПРАВИЛА СООБЩЕСТВА «СОЗВЕЗДИЕ»\n\n"
+        "Выбери пункт, чтобы прочитать его:",
+        reply_markup=user_rules_keyboard(),
+    )
+
+
+@dp.message(Command("rule"), F.chat.type == "private")
+async def show_rule(message: Message):
+    await message.answer(
+        "📚 ПРАВИЛА СООБЩЕСТВА «СОЗВЕЗДИЕ»\n\n"
+        "Выбери пункт, чтобы прочитать его:",
+        reply_markup=user_rules_keyboard(),
+    )
+
+
+# ==========================================
+# ПОДТВЕРЖДЕНИЕ ОЗНАКОМЛЕНИЯ С ПРАВИЛАМИ
+# ==========================================
+
+@dp.callback_query(F.data == "accept_rules")
+async def accept_rules(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    async with Session() as session:
+        existing = await session.scalar(
+            select(RuleAcceptance).where(
+                RuleAcceptance.user_id == user_id
+            )
+        )
+
+        if existing:
+            await callback.message.answer(
+                "✅ Ты уже подтверждал ознакомление с правилами."
+            )
+            await callback.answer()
+            return
+
+        session.add(
+            RuleAcceptance(
+                user_id=user_id,
+                accepted_at=utc_now(),
+            )
+        )
+
+        await session.commit()
+
+    await callback.message.answer(
+        "✅ Ознакомление с правилами зафиксировано.\n\n"
+        "Спасибо! Если правила изменятся, рекомендуем "
+        "ознакомиться с обновлённой версией."
+    )
+    await callback.answer("Сохранено.")
 
 
 # ==========================================
@@ -439,13 +605,13 @@ async def receive_appeal(message: Message):
             [
                 InlineKeyboardButton(
                     text="Ответить",
-                    callback_data=f"reply_appeal_{appeal_id}"
+                    callback_data=f"reply_appeal_{appeal_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="Рассмотрено",
-                    callback_data=f"close_appeal_{appeal_id}"
+                    callback_data=f"close_appeal_{appeal_id}",
                 )
             ],
         ]
@@ -458,7 +624,7 @@ async def receive_appeal(message: Message):
             f"Пользователь: {user_id}\n\n"
             f"Текст:\n{text}"
         ),
-        reply_markup=keyboard
+        reply_markup=keyboard,
     )
 
 
@@ -486,7 +652,7 @@ async def reply_appeal(callback: CallbackQuery):
 @dp.message(Command("answer"), F.chat.type == "private")
 async def answer_appeal(
     message: Message,
-    command: CommandObject
+    command: CommandObject,
 ):
     if not is_admin(message):
         await message.answer("Нет доступа.")
@@ -532,7 +698,7 @@ async def answer_appeal(
                 f"📩 ОТВЕТ АДМИНИСТРАЦИИ\n"
                 f"Обращение №{appeal_id}\n\n"
                 f"{answer_text}"
-            )
+            ),
         )
     except Exception:
         await message.answer(
@@ -562,59 +728,27 @@ async def close_appeal(callback: CallbackQuery):
         if appeal is None:
             await callback.answer(
                 "Обращение не найдено.",
-                show_alert=True
+                show_alert=True,
             )
             return
 
         appeal.status = "reviewed"
         await session.commit()
+        target_user = appeal.user_id
 
     await callback.message.answer(
         f"Обращение №{appeal_id} отмечено рассмотренным."
     )
+
+    try:
+        await bot.send_message(
+            target_user,
+            f"📨 Твоё обращение №{appeal_id} отмечено как рассмотренное.",
+        )
+    except Exception:
+        pass
+
     await callback.answer("Сохранено.")
-
-
-# ==========================================
-# ПРАВИЛА
-# ==========================================
-
-@dp.message(Command("rules"), F.chat.type == "private")
-async def show_rules(message: Message):
-    if not is_admin(message):
-        await message.answer("Нет доступа.")
-        return
-
-    lines = ["📚 СПИСОК ПУНКТОВ ПРАВИЛ\n"]
-
-    for rule_id, rule in RULES.items():
-        lines.append(f"{rule_id} — {rule['title']}")
-
-    lines.append("\nДля подробностей: /rule 2.3")
-    await message.answer("\n".join(lines))
-
-
-@dp.message(Command("rule"), F.chat.type == "private")
-async def show_rule(
-    message: Message,
-    command: CommandObject
-):
-    if not is_admin(message):
-        await message.answer("Нет доступа.")
-        return
-
-    if not command.args:
-        await message.answer("Пример: /rule 2.3")
-        return
-
-    rule_id = command.args.strip()
-    rule = RULES.get(rule_id)
-
-    if not rule:
-        await message.answer("Пункт не найден.")
-        return
-
-    await message.answer(format_rule(rule_id))
 
 
 # ==========================================
@@ -641,7 +775,7 @@ async def old_penalty_disabled(message: Message):
 @dp.message(Command("confirm"), F.chat.type == "private")
 async def confirm_event(
     message: Message,
-    command: CommandObject
+    command: CommandObject,
 ):
     if not is_admin(message):
         await message.answer("Нет доступа.")
@@ -694,7 +828,7 @@ async def confirm_event(
             f"Правило: {rule_id}\n\n"
             "Выбери вариант решения. Само нажатие "
             "кнопки ещё не применяет наказание:",
-            reply_markup=penalty_keyboard(event_id, rule_id)
+            reply_markup=penalty_keyboard(event_id, rule_id),
         )
 
 
@@ -744,7 +878,6 @@ async def penalty_pick(callback: CallbackQuery):
             return
 
         option = options[option_index]
-
         option_type = option.get("type")
 
         if option_type not in ("remark", "warning", "mute"):
@@ -777,7 +910,7 @@ async def penalty_pick(callback: CallbackQuery):
 @dp.message(Command("apply"), F.chat.type == "private")
 async def apply_penalty(
     message: Message,
-    command: CommandObject
+    command: CommandObject,
 ):
     if not is_admin(message):
         await message.answer("Нет доступа.")
@@ -861,7 +994,7 @@ async def apply_penalty(
         if not get_option_for_duration(
             options,
             penalty_type,
-            duration
+            duration,
         ):
             await message.answer(
                 "Такой вариант или срок не предусмотрен "
@@ -892,8 +1025,8 @@ async def apply_penalty(
             expires_at = now + timedelta(minutes=duration)
             duration_text = f"{duration} мин."
 
-        # Для ограничения сначала проверяем возможность действия Telegram.
-        # Запись в БД создаётся после успешного ответа Telegram.
+        # Ограничение применяет только администратор
+        # после проверки события и допустимого срока.
         if penalty_type == "mute":
             try:
                 await message.bot.restrict_chat_member(
@@ -957,31 +1090,12 @@ async def apply_penalty(
         except Exception:
             await session.rollback()
 
-            if penalty_type == "mute":
-                try:
-                    await message.bot.restrict_chat_member(
-                        chat_id=event.chat_id,
-                        user_id=event.user_id,
-                        permissions=ChatPermissions(
-                            can_send_messages=True,
-                            can_send_audios=True,
-                            can_send_documents=True,
-                            can_send_photos=True,
-                            can_send_videos=True,
-                            can_send_video_notes=True,
-                            can_send_voice_notes=True,
-                            can_send_polls=True,
-                            can_send_other_messages=True,
-                            can_add_web_page_previews=True,
-                        ),
-                    )
-                except Exception:
-                    pass
-
             await message.answer(
-                "Не удалось сохранить решение в базе данных. "
-                "Проверь журнал Render. Если это было ограничение, "
-                "проверь также статус участника в Telegram."
+                "Не удалось сохранить решение в базе данных.\n\n"
+                "Если Telegram уже применил ограничение, проверь "
+                "статус участника вручную в настройках группы. "
+                "Бот не будет автоматически менять права участника, "
+                "чтобы случайно не снять другие ограничения."
             )
             return
 
@@ -1002,7 +1116,7 @@ async def apply_penalty(
         await message.bot.send_message(
             target_user,
             notification,
-            reply_markup=user_menu()
+            reply_markup=user_menu(),
         )
     except Exception:
         await message.answer(
@@ -1119,7 +1233,7 @@ async def panel(message: Message):
         return
 
     await message.answer(
-        "ПАНЕЛЬ МОДЕРАТОРА «СОЗВЕЗДИЕ»\n\n"
+        "ПАНЕЛЬ МОДЕРАТОРА «СОЗВЕЗДИЯ»\n\n"
         "/stats — статистика\n"
         "/events — последние события\n"
         "/review — очередь проверки\n"
@@ -1127,12 +1241,11 @@ async def panel(message: Message):
         "/apply ID TYPE СРОК — применить решение\n"
         "/dismiss ID — отклонить подозрение\n"
         "/rules — список правил\n"
-        "/rule ID — подробности правила\n"
+        "/rule — список пунктов с кнопками\n"
         "/answer ID ТЕКСТ — ответить на обращение\n"
         "/id — узнать ID\n\n"
-        "Автоматические наказания отключены."
-        ,
-        reply_markup=admin_menu()
+        "Автоматические наказания отключены.",
+        reply_markup=admin_menu(),
     )
 
 
@@ -1172,7 +1285,7 @@ async def stats(message: Message):
             counts[event_type] = await session.scalar(
                 select(func.count(Event.id)).where(
                     Event.chat_id == TARGET_CHAT_ID,
-                    Event.event_type == event_type
+                    Event.event_type == event_type,
                 )
             )
 
@@ -1247,7 +1360,7 @@ async def review(message: Message):
         decisions = await session.scalars(
             select(Event).where(
                 Event.chat_id == TARGET_CHAT_ID,
-                Event.event_type.in_(REVIEW_TYPES)
+                Event.event_type.in_(REVIEW_TYPES),
             )
         )
 
@@ -1259,7 +1372,7 @@ async def review(message: Message):
 
             match = re.search(
                 r"(?:^|[; ])event_id=(\d+)",
-                decision.details
+                decision.details,
             )
 
             if match:
@@ -1269,7 +1382,7 @@ async def review(message: Message):
             select(Event)
             .where(
                 Event.chat_id == TARGET_CHAT_ID,
-                Event.event_type.in_(SUSPICIOUS_TYPES)
+                Event.event_type.in_(SUSPICIOUS_TYPES),
             )
             .order_by(desc(Event.id))
         )
@@ -1356,7 +1469,7 @@ async def observe(message: Message):
                 user_id=user_id,
                 message_id=message.message_id,
                 event_type="message_seen",
-                details="Текст сообщения не сохраняется."
+                details="Текст сообщения не сохраняется.",
             )
         )
 
@@ -1372,7 +1485,7 @@ async def observe(message: Message):
                 Event.chat_id == TARGET_CHAT_ID,
                 Event.user_id == user_id,
                 Event.event_type == "message_seen",
-                Event.created_at >= flood_cutoff
+                Event.created_at >= flood_cutoff,
             )
         )
 
@@ -1382,7 +1495,7 @@ async def observe(message: Message):
                     Event.chat_id == TARGET_CHAT_ID,
                     Event.user_id == user_id,
                     Event.event_type == "flood_suspected",
-                    Event.created_at >= flood_cutoff
+                    Event.created_at >= flood_cutoff,
                 ).limit(1)
             )
 
@@ -1397,12 +1510,12 @@ async def observe(message: Message):
                             f"{FLOOD_LIMIT}+ сообщений за "
                             f"{FLOOD_WINDOW_SECONDS} секунд. "
                             "Нужна проверка контекста."
-                        )
+                        ),
                     )
                 )
 
         if text and not text.lstrip().startswith("/"):
-            # Спам
+            # Спам.
             if is_spam_suspected(user_id, text):
                 spam_cutoff = now - timedelta(
                     seconds=SPAM_WINDOW_SECONDS
@@ -1413,7 +1526,7 @@ async def observe(message: Message):
                         Event.chat_id == TARGET_CHAT_ID,
                         Event.user_id == user_id,
                         Event.event_type == "spam_suspected",
-                        Event.created_at >= spam_cutoff
+                        Event.created_at >= spam_cutoff,
                     ).limit(1)
                 )
 
@@ -1428,7 +1541,7 @@ async def observe(message: Message):
                                 "Повтор одинакового сообщения "
                                 f"{SPAM_LIMIT}+ раза за "
                                 f"{SPAM_WINDOW_SECONDS} секунд."
-                            )
+                            ),
                         )
                     )
 
@@ -1453,7 +1566,7 @@ async def observe(message: Message):
                         Event.chat_id == TARGET_CHAT_ID,
                         Event.user_id == user_id,
                         Event.event_type == "caps_suspected",
-                        Event.created_at >= caps_cutoff
+                        Event.created_at >= caps_cutoff,
                     ).limit(1)
                 )
 
@@ -1468,7 +1581,7 @@ async def observe(message: Message):
                                 f"{CAPS_LIMIT}+ CAPS-сообщений за "
                                 f"{CAPS_WINDOW_SECONDS // 60} минуты. "
                                 "Нужна проверка контекста."
-                            )
+                            ),
                         )
                     )
 

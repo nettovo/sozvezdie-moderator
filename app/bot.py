@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -8,6 +10,9 @@ from .db import Session, Event
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+FLOOD_LIMIT = 5
+FLOOD_WINDOW_SECONDS = 10
 
 
 def is_admin(message: Message) -> bool:
@@ -36,14 +41,15 @@ async def show_id(message: Message):
 @dp.message(Command("panel"), F.chat.type == "private")
 async def panel(message: Message):
     if not is_admin(message):
-        await message.answer("У тебя нет доступа к панели управления.")
+        await message.answer("Нет доступа к панели управления.")
         return
 
     await message.answer(
         "ПАНЕЛЬ МОДЕРАТОРА «СОЗВЕЗДИЕ»\n\n"
         "/stats — статистика событий\n"
-        "/events — последние зарегистрированные события\n\n"
-        "Режим: наблюдение. Наказания отключены."
+        "/events — последние события\n\n"
+        "Режим: наблюдение.\n"
+        "Автоматические наказания отключены."
     )
 
 
@@ -64,11 +70,18 @@ async def stats(message: Message):
                 Event.chat_id == TARGET_CHAT_ID
             )
         )
+        flood = await session.scalar(
+            select(func.count(Event.id)).where(
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type == "flood_suspected"
+            )
+        )
 
     await message.answer(
         "СТАТИСТИКА «СОЗВЕЗДИЯ»\n\n"
         f"Зарегистрировано событий: {total or 0}\n"
         f"Участников в журнале: {users or 0}\n"
+        f"Подозрений на флуд: {flood or 0}\n"
         "Автоматические наказания: выключены."
     )
 
@@ -98,6 +111,7 @@ async def events(message: Message):
             f"ID записи: {event.id}\n"
             f"Участник: {event.user_id}\n"
             f"Тип: {event.event_type}\n"
+            f"Причина: {event.details}\n"
         )
 
     await message.answer("\n".join(lines))
@@ -123,3 +137,32 @@ async def observe(message: Message):
             )
         )
         await session.commit()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=FLOOD_WINDOW_SECONDS
+        )
+
+        recent_count = await session.scalar(
+            select(func.count(Event.id)).where(
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.user_id == message.from_user.id,
+                Event.event_type == "message_seen",
+                Event.created_at >= cutoff
+            )
+        )
+
+        if recent_count == FLOOD_LIMIT:
+            session.add(
+                Event(
+                    chat_id=TARGET_CHAT_ID,
+                    user_id=message.from_user.id,
+                    message_id=message.message_id,
+                    event_type="flood_suspected",
+                    details=(
+                        f"{FLOOD_LIMIT} сообщений за "
+                        f"{FLOOD_WINDOW_SECONDS} секунд. "
+                        "Требуется проверка модератором."
+                    )
+                )
+            )
+            await session.commit()

@@ -1,3 +1,4 @@
+
 import hashlib
 import re
 
@@ -14,19 +15,13 @@ from aiogram.types import (
     InlineKeyboardButton,
     ChatPermissions,
 )
-
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from sqlalchemy import select, func, desc
 
 from .config import BOT_TOKEN, ADMIN_ID, TARGET_CHAT_ID
-
 from .db import Session, Event, Appeal, Penalty
-from .policy import (
-    RULES,
-    format_rule,
-    get_penalty_options,
-)
+from .policy import RULES, format_rule, get_penalty_options
 
 
 # ==========================================
@@ -42,7 +37,7 @@ dp = Dispatcher()
 FLOOD_LIMIT = 5
 FLOOD_WINDOW_SECONDS = 10
 
-SPAM_LIMIT = 4
+SPAM_LIMIT = 3
 SPAM_WINDOW_SECONDS = 120
 SPAM_MIN_LENGTH = 3
 
@@ -50,6 +45,8 @@ CAPS_LIMIT = 5
 CAPS_WINDOW_SECONDS = 120
 CAPS_MIN_LETTERS = 3
 CAPS_RATIO = 1.0
+
+MAX_PENALTY_AGE_HOURS = 12
 
 SUSPICIOUS_TYPES = [
     "flood_suspected",
@@ -62,11 +59,14 @@ REVIEW_TYPES = [
     "review_dismissed",
 ]
 
+EVENT_RULES = {
+    "flood_suspected": "2.2",
+    "spam_suspected": "2.3",
+    "caps_suspected": "2.4",
+}
+
 spam_history = defaultdict(deque)
 caps_history = defaultdict(deque)
-
-# Ожидание текста обращения в текущем процессе.
-# Позже заменим постоянным хранением в БД.
 appeal_waiting = set()
 
 
@@ -83,11 +83,17 @@ def is_admin(message: Message) -> bool:
         message.from_user
         and is_admin_id(message.from_user.id)
     )
-    EVENT_RULES = {
-    "flood_suspected": "2.2",
-    "spam_suspected": "2.3",
-    "caps_suspected": "2.4",
-    }
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def ensure_utc(value: datetime) -> datetime:
+    """Приводит дату из БД к UTC, в том числе для SQLite."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def user_menu():
@@ -125,6 +131,7 @@ def admin_menu():
     builder.adjust(1)
     return builder.as_markup()
 
+
 def penalty_keyboard(event_id, rule_id):
     options = get_penalty_options(rule_id)
     builder = InlineKeyboardBuilder()
@@ -137,6 +144,7 @@ def penalty_keyboard(event_id, rule_id):
 
     builder.adjust(1)
     return builder.as_markup()
+
 
 def normalize_text(text: str) -> str:
     text = text.lower()
@@ -176,7 +184,7 @@ def is_spam_suspected(user_id: int, text: str) -> bool:
     fingerprint = get_fingerprint(normalized)
     key = (user_id, fingerprint)
 
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     cutoff = now - timedelta(
         seconds=SPAM_WINDOW_SECONDS
     )
@@ -193,12 +201,65 @@ def is_spam_suspected(user_id: int, text: str) -> bool:
 
 async def send_admin(text: str):
     try:
-        await bot.send_message(
-            ADMIN_ID,
-            text
-        )
+        await bot.send_message(ADMIN_ID, text)
     except Exception:
         pass
+
+
+async def get_review_decision(session, event_id):
+    """Возвращает существующее решение по событию, если оно есть."""
+    decisions = await session.scalars(
+        select(Event).where(
+            Event.chat_id == TARGET_CHAT_ID,
+            Event.event_type.in_(REVIEW_TYPES),
+        )
+    )
+
+    for decision in decisions.all():
+        if not decision.details:
+            continue
+
+        match = re.search(
+            r"(?:^|[; ])event_id=(\d+)",
+            decision.details
+        )
+
+        if match and int(match.group(1)) == event_id:
+            return decision
+
+    return None
+
+
+def get_option_for_duration(options, penalty_type, duration=None):
+    """Проверяет, разрешён ли тип решения и его срок для правила."""
+    matching = [
+        option for option in options
+        if option.get("type") == penalty_type
+    ]
+
+    if not matching:
+        return False
+
+    if penalty_type == "remark":
+        return True
+
+    if penalty_type == "warning":
+        return any(
+            option.get("min_days", 0)
+            <= duration
+            <= option.get("max_days", 0)
+            for option in matching
+        )
+
+    if penalty_type == "mute":
+        return any(
+            option.get("min_minutes", 0)
+            <= duration
+            <= option.get("max_minutes", 0)
+            for option in matching
+        )
+
+    return False
 
 
 # ==========================================
@@ -207,7 +268,6 @@ async def send_admin(text: str):
 
 @dp.message(CommandStart(), F.chat.type == "private")
 async def start(message: Message):
-
     await message.answer(
         "⭐ Добро пожаловать в систему модерации "
         "«Созвездие»!\n\n"
@@ -232,30 +292,39 @@ async def start(message: Message):
 
 @dp.callback_query(F.data == "my_penalties")
 async def my_penalties(callback: CallbackQuery):
-
     user_id = callback.from_user.id
+    now = utc_now()
 
     async with Session() as session:
-
         result = await session.scalars(
-            select(Event)
+            select(Penalty)
             .where(
-                Event.chat_id == TARGET_CHAT_ID,
-                Event.user_id == user_id,
-                Event.event_type.in_([
-                    "penalty",
-                    "warning",
-                    "mute",
-                    "ban",
-                    "remark",
-                    "penalty_cancelled",
-                ])
+                Penalty.chat_id == TARGET_CHAT_ID,
+                Penalty.user_id == user_id,
             )
-            .order_by(desc(Event.id))
-            .limit(20)
+            .order_by(desc(Penalty.created_at))
+            .limit(30)
         )
 
         rows = result.all()
+
+        active = []
+        history = []
+
+        for penalty in rows:
+            if (
+                penalty.status == "issued"
+                and penalty.expires_at is not None
+                and ensure_utc(penalty.expires_at) <= now
+            ):
+                penalty.status = "completed"
+
+            if penalty.status == "issued" and penalty.expires_at is not None:
+                active.append(penalty)
+            else:
+                history.append(penalty)
+
+        await session.commit()
 
     if not rows:
         await callback.message.answer(
@@ -266,17 +335,38 @@ async def my_penalties(callback: CallbackQuery):
 
     lines = ["📋 ТВОЯ ИСТОРИЯ МОДЕРАЦИИ\n"]
 
-    for event in rows:
-        lines.append(
-            f"Запись №{event.id}\n"
-            f"{event.details}\n"
-            "--------------------"
-        )
+    if active:
+        lines.append("🟢 ДЕЙСТВУЮЩИЕ РЕШЕНИЯ\n")
 
-    await callback.message.answer(
-        "\n".join(lines)
-    )
+        for penalty in active:
+            lines.append(
+                f"№{penalty.id}\n"
+                f"Правило: {penalty.rule_id}\n"
+                f"Тип: {penalty.penalty_type}\n"
+                f"Срок: {penalty.duration_text or 'не указан'}\n"
+                f"Причина: {penalty.reason}\n"
+            )
 
+    if history:
+        lines.append("📚 ИСТОРИЯ\n")
+
+        for penalty in history:
+            if penalty.status == "cancelled":
+                status = "Отменено"
+            elif penalty.status == "completed":
+                status = "Завершено"
+            else:
+                status = "Запись"
+
+            lines.append(
+                f"№{penalty.id} — {status}\n"
+                f"Правило: {penalty.rule_id}\n"
+                f"Тип: {penalty.penalty_type}\n"
+                f"Срок: {penalty.duration_text or 'не указан'}\n"
+                f"Причина: {penalty.reason}\n"
+            )
+
+    await callback.message.answer("\n".join(lines))
     await callback.answer()
 
 
@@ -286,7 +376,6 @@ async def my_penalties(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "contact_admin")
 async def contact_admin(callback: CallbackQuery):
-
     user_id = callback.from_user.id
     appeal_waiting.add(user_id)
 
@@ -304,7 +393,6 @@ async def contact_admin(callback: CallbackQuery):
 
 @dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def receive_appeal(message: Message):
-    
     if not message.from_user:
         return
 
@@ -316,7 +404,7 @@ async def receive_appeal(message: Message):
     if is_admin(message):
         return
 
-    text = message.text or message.caption or ""
+    text = message.text or ""
 
     if not text.strip():
         await message.answer(
@@ -327,7 +415,6 @@ async def receive_appeal(message: Message):
     appeal_waiting.discard(user_id)
 
     async with Session() as session:
-
         appeal = Appeal(
             event_id=0,
             user_id=user_id,
@@ -342,8 +429,7 @@ async def receive_appeal(message: Message):
         appeal_id = appeal.id
 
     await message.answer(
-        f"✅ Обращение №{appeal_id} отправлено "
-        "администрации.\n\n"
+        f"✅ Обращение №{appeal_id} отправлено администрации.\n\n"
         "Ожидай ответа. Пожалуйста, не отправляй "
         "повторные обращения по тому же вопросу."
     )
@@ -382,14 +468,11 @@ async def receive_appeal(message: Message):
 
 @dp.callback_query(F.data.startswith("reply_appeal_"))
 async def reply_appeal(callback: CallbackQuery):
-
     if not is_admin_id(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    appeal_id = int(
-        callback.data.rsplit("_", 1)[1]
-    )
+    appeal_id = int(callback.data.rsplit("_", 1)[1])
 
     await callback.message.answer(
         f"Напиши ответ на обращение №{appeal_id} "
@@ -405,7 +488,6 @@ async def answer_appeal(
     message: Message,
     command: CommandObject
 ):
-
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
@@ -433,17 +515,12 @@ async def answer_appeal(
     answer_text = parts[1]
 
     async with Session() as session:
-
         appeal = await session.scalar(
-            select(Appeal).where(
-                Appeal.id == appeal_id
-            )
+            select(Appeal).where(Appeal.id == appeal_id)
         )
 
         if appeal is None:
-            await message.answer(
-                "Обращение не найдено."
-            )
+            await message.answer("Обращение не найдено.")
             return
 
         target_user = appeal.user_id
@@ -471,21 +548,15 @@ async def answer_appeal(
 
 @dp.callback_query(F.data.startswith("close_appeal_"))
 async def close_appeal(callback: CallbackQuery):
-
     if not is_admin_id(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    appeal_id = int(
-        callback.data.rsplit("_", 1)[1]
-    )
+    appeal_id = int(callback.data.rsplit("_", 1)[1])
 
     async with Session() as session:
-
         appeal = await session.scalar(
-            select(Appeal).where(
-                Appeal.id == appeal_id
-            )
+            select(Appeal).where(Appeal.id == appeal_id)
         )
 
         if appeal is None:
@@ -501,17 +572,15 @@ async def close_appeal(callback: CallbackQuery):
     await callback.message.answer(
         f"Обращение №{appeal_id} отмечено рассмотренным."
     )
-
     await callback.answer("Сохранено.")
 
 
 # ==========================================
-# ВЫДАЧА НАКАЗАНИЙ
+# ПРАВИЛА
 # ==========================================
 
 @dp.message(Command("rules"), F.chat.type == "private")
 async def show_rules(message: Message):
-
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
@@ -519,14 +588,9 @@ async def show_rules(message: Message):
     lines = ["📚 СПИСОК ПУНКТОВ ПРАВИЛ\n"]
 
     for rule_id, rule in RULES.items():
-        lines.append(
-            f"{rule_id} — {rule['title']}"
-        )
+        lines.append(f"{rule_id} — {rule['title']}")
 
-    lines.append(
-        "\nДля подробностей: /rule 2.3"
-    )
-
+    lines.append("\nДля подробностей: /rule 2.3")
     await message.answer("\n".join(lines))
 
 
@@ -535,15 +599,12 @@ async def show_rule(
     message: Message,
     command: CommandObject
 ):
-
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
 
     if not command.args:
-        await message.answer(
-            "Пример: /rule 2.3"
-        )
+        await message.answer("Пример: /rule 2.3")
         return
 
     rule_id = command.args.strip()
@@ -553,111 +614,480 @@ async def show_rule(
         await message.answer("Пункт не найден.")
         return
 
+    await message.answer(format_rule(rule_id))
+
+
+# ==========================================
+# СТАРАЯ КОМАНДА НАКАЗАНИЙ ОТКЛЮЧЕНА
+# ==========================================
+
+@dp.message(Command("penalty"), F.chat.type == "private")
+async def old_penalty_disabled(message: Message):
+    if not is_admin(message):
+        await message.answer("Нет доступа.")
+        return
+
     await message.answer(
-        format_rule(rule_id)
+        "Старая команда /penalty отключена.\n\n"
+        "Теперь сначала открой очередь /review, "
+        "проверь событие и используй /confirm ID."
     )
 
 
-@dp.message(Command("penalty"), F.chat.type == "private")
-async def issue_penalty(
+# ==========================================
+# ПОДТВЕРЖДЕНИЕ СОБЫТИЯ И ВЫБОР РЕШЕНИЯ
+# ==========================================
+
+@dp.message(Command("confirm"), F.chat.type == "private")
+async def confirm_event(
     message: Message,
     command: CommandObject
 ):
+    if not is_admin(message):
+        await message.answer("Нет доступа.")
+        return
 
+    if not command.args:
+        await message.answer("Использование: /confirm ID_СОБЫТИЯ")
+        return
+
+    try:
+        event_id = int(command.args.strip())
+    except ValueError:
+        await message.answer("ID события должен быть числом.")
+        return
+
+    async with Session() as session:
+        event = await session.scalar(
+            select(Event).where(
+                Event.id == event_id,
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type.in_(SUSPICIOUS_TYPES),
+            )
+        )
+
+        if event is None:
+            await message.answer("Подозрительное событие не найдено.")
+            return
+
+        decision = await get_review_decision(session, event_id)
+
+        if decision:
+            await message.answer("Это событие уже обработано.")
+            return
+
+        rule_id = EVENT_RULES.get(event.event_type)
+
+        if not rule_id:
+            await message.answer("Для события не найдено правило.")
+            return
+
+        options = get_penalty_options(rule_id)
+
+        if not options:
+            await message.answer("Для правила нет вариантов решения.")
+            return
+
+        await message.answer(
+            f"Событие №{event_id}\n"
+            f"Участник: {event.user_id}\n"
+            f"Правило: {rule_id}\n\n"
+            "Выбери вариант решения. Само нажатие "
+            "кнопки ещё не применяет наказание:",
+            reply_markup=penalty_keyboard(event_id, rule_id)
+        )
+
+
+@dp.callback_query(F.data.startswith("penalty_pick:"))
+async def penalty_pick(callback: CallbackQuery):
+    if not is_admin_id(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    try:
+        _, event_id_text, index_text = callback.data.split(":")
+        event_id = int(event_id_text)
+        option_index = int(index_text)
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+
+    async with Session() as session:
+        event = await session.scalar(
+            select(Event).where(
+                Event.id == event_id,
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type.in_(SUSPICIOUS_TYPES),
+            )
+        )
+
+        if event is None:
+            await callback.answer("Событие не найдено.", show_alert=True)
+            return
+
+        decision = await get_review_decision(session, event_id)
+
+        if decision:
+            await callback.answer("Событие уже обработано.", show_alert=True)
+            return
+
+        rule_id = EVENT_RULES.get(event.event_type)
+
+        if not rule_id:
+            await callback.answer("Правило не найдено.", show_alert=True)
+            return
+
+        options = get_penalty_options(rule_id)
+
+        if option_index < 0 or option_index >= len(options):
+            await callback.answer("Вариант не найден.", show_alert=True)
+            return
+
+        option = options[option_index]
+
+        option_type = option.get("type")
+
+        if option_type not in ("remark", "warning", "mute"):
+            await callback.message.answer(
+                f"Выбран вариант: {option['label']}\n\n"
+                "Этот вариант требует отдельного ручного решения. "
+                "Бот не будет применять его автоматически."
+            )
+        else:
+            await callback.message.answer(
+                f"Выбран вариант: {option['label']}\n"
+                f"Событие: №{event_id}\n\n"
+                "Для замечания:\n"
+                f"/apply {event_id} remark\n\n"
+                "Для предупреждения:\n"
+                f"/apply {event_id} warning ДНИ\n\n"
+                "Для ограничения чата:\n"
+                f"/apply {event_id} mute МИНУТЫ\n\n"
+                "Перед применением ещё раз проверь обстоятельства "
+                "и доказательства."
+            )
+
+    await callback.answer()
+
+
+# ==========================================
+# ПРИМЕНЕНИЕ РЕШЕНИЯ
+# ==========================================
+
+@dp.message(Command("apply"), F.chat.type == "private")
+async def apply_penalty(
+    message: Message,
+    command: CommandObject
+):
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
 
     if not command.args:
         await message.answer(
-            "Формат:\n"
-            "/penalty USER_ID ПУНКТ ТИП СРОК\n\n"
-            "Пример:\n"
-            "/penalty 123456789 2.3 warning 3\n\n"
-            "Типы: remark, warning, mute, ban"
+            "Использование:\n"
+            "/apply ID remark\n"
+            "/apply ID warning ДНИ\n"
+            "/apply ID mute МИНУТЫ"
         )
         return
 
-    parts = command.args.split(maxsplit=3)
+    parts = command.args.split()
 
-    if len(parts) < 3:
-        await message.answer("Недостаточно параметров.")
+    if len(parts) < 2 or len(parts) > 3:
+        await message.answer("Неверное количество параметров.")
         return
 
     try:
-        target_user = int(parts[0])
+        event_id = int(parts[0])
     except ValueError:
-        await message.answer("Неверный ID пользователя.")
+        await message.answer("ID события должен быть числом.")
         return
 
-    rule_id = parts[1]
-    penalty_type = parts[2]
+    penalty_type = parts[1].lower()
 
-    if rule_id not in RULES:
-        await message.answer("Такого пункта правил нет.")
+    if penalty_type not in ("remark", "warning", "mute"):
+        await message.answer("Неизвестный тип решения.")
         return
 
-    if penalty_type not in [
-        "remark",
-        "warning",
-        "mute",
-        "ban",
-    ]:
-        await message.answer("Неизвестный тип наказания.")
+    duration = None
+
+    if penalty_type == "remark" and len(parts) != 2:
+        await message.answer("Для замечания срок указывать не нужно.")
         return
 
-    duration = parts[3] if len(parts) > 3 else "без срока"
+    if penalty_type in ("warning", "mute"):
+        if len(parts) != 3:
+            await message.answer("Укажи срок.")
+            return
 
-    rule_text = format_rule(rule_id)
+        try:
+            duration = int(parts[2])
+        except ValueError:
+            await message.answer("Срок должен быть целым числом.")
+            return
 
-    details = (
-        f"Наказание: {penalty_type}\n"
-        f"Пункт: {rule_id}\n"
-        f"Срок: {duration}\n\n"
-        f"{rule_text}"
-    )
+        if duration <= 0:
+            await message.answer("Срок должен быть больше нуля.")
+            return
 
     async with Session() as session:
-
-        event = Event(
-            chat_id=TARGET_CHAT_ID,
-            user_id=target_user,
-            message_id=0,
-            event_type="penalty",
-            details=details,
+        event = await session.scalar(
+            select(Event).where(
+                Event.id == event_id,
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type.in_(SUSPICIOUS_TYPES),
+            )
         )
 
-        session.add(event)
-        await session.commit()
-        await session.refresh(event)
+        if event is None:
+            await message.answer("Событие не найдено.")
+            return
 
-        penalty_id = event.id
+        decision = await get_review_decision(session, event_id)
+
+        if decision:
+            await message.answer("Событие уже обработано.")
+            return
+
+        rule_id = EVENT_RULES.get(event.event_type)
+
+        if not rule_id:
+            await message.answer("Для события не найдено правило.")
+            return
+
+        options = get_penalty_options(rule_id)
+
+        if not get_option_for_duration(
+            options,
+            penalty_type,
+            duration
+        ):
+            await message.answer(
+                "Такой вариант или срок не предусмотрен "
+                "для данного правила."
+            )
+            return
+
+        event_created = ensure_utc(event.created_at)
+        now = utc_now()
+
+        if now - event_created > timedelta(
+            hours=MAX_PENALTY_AGE_HOURS
+        ):
+            await message.answer(
+                "Событие старше допустимого 12-часового срока. "
+                "Наказание по нему не применено."
+            )
+            return
+
+        expires_at = None
+        duration_text = ""
+
+        if penalty_type == "warning":
+            expires_at = now + timedelta(days=duration)
+            duration_text = f"{duration} дн."
+
+        elif penalty_type == "mute":
+            expires_at = now + timedelta(minutes=duration)
+            duration_text = f"{duration} мин."
+
+        # Для ограничения сначала проверяем возможность действия Telegram.
+        # Запись в БД создаётся после успешного ответа Telegram.
+        if penalty_type == "mute":
+            try:
+                await message.bot.restrict_chat_member(
+                    chat_id=event.chat_id,
+                    user_id=event.user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_audios=False,
+                        can_send_documents=False,
+                        can_send_photos=False,
+                        can_send_videos=False,
+                        can_send_video_notes=False,
+                        can_send_voice_notes=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                    ),
+                    until_date=expires_at,
+                )
+            except Exception:
+                await message.answer(
+                    "Telegram не смог применить ограничение. "
+                    "Запись о наказании не создана. Проверь права бота "
+                    "и возможность ограничения этого участника."
+                )
+                return
+
+        penalty = Penalty(
+            chat_id=event.chat_id,
+            user_id=event.user_id,
+            event_id=event.id,
+            rule_id=rule_id,
+            penalty_type=penalty_type,
+            duration_text=duration_text,
+            duration_minutes=duration if penalty_type == "mute" else None,
+            reason=f"Решение по событию №{event_id}",
+            status="issued",
+            issued_by=message.from_user.id,
+            expires_at=expires_at,
+        )
+
+        session.add(penalty)
+
+        session.add(
+            Event(
+                chat_id=event.chat_id,
+                user_id=event.user_id,
+                message_id=event.message_id,
+                event_type="review_confirmed",
+                details=(
+                    f"event_id={event_id}; "
+                    f"rule={rule_id}; "
+                    f"type={penalty_type}"
+                ),
+            )
+        )
+
+        try:
+            await session.commit()
+            await session.refresh(penalty)
+        except Exception:
+            await session.rollback()
+
+            if penalty_type == "mute":
+                try:
+                    await message.bot.restrict_chat_member(
+                        chat_id=event.chat_id,
+                        user_id=event.user_id,
+                        permissions=ChatPermissions(
+                            can_send_messages=True,
+                            can_send_audios=True,
+                            can_send_documents=True,
+                            can_send_photos=True,
+                            can_send_videos=True,
+                            can_send_video_notes=True,
+                            can_send_voice_notes=True,
+                            can_send_polls=True,
+                            can_send_other_messages=True,
+                            can_add_web_page_previews=True,
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            await message.answer(
+                "Не удалось сохранить решение в базе данных. "
+                "Проверь журнал Render. Если это было ограничение, "
+                "проверь также статус участника в Telegram."
+            )
+            return
+
+        target_user = event.user_id
+        saved_penalty_id = penalty.id
+
+    notification = (
+        "⚖️ УВЕДОМЛЕНИЕ О РЕШЕНИИ МОДЕРАЦИИ\n\n"
+        f"Номер решения: {saved_penalty_id}\n"
+        f"Правило: {rule_id}\n"
+        f"Тип решения: {penalty_type}\n"
+        f"Срок: {duration_text or 'без срока'}\n\n"
+        "Если ты не согласен с решением, открой меню бота "
+        "и подай обращение администрации."
+    )
 
     try:
-        await bot.send_message(
+        await message.bot.send_message(
             target_user,
-            (
-                f"⚖️ УВЕДОМЛЕНИЕ О НАКАЗАНИИ\n\n"
-                f"Номер: {penalty_id}\n"
-                f"{details}\n\n"
-                "Если ты не согласен с решением, "
-                "открой меню бота и подай апелляцию.\n"
-                "Срок подачи апелляции — 24 часа."
-            ),
+            notification,
             reply_markup=user_menu()
         )
-
-        await message.answer(
-            f"Запись о наказании №{penalty_id} создана. "
-            "Уведомление отправлено пользователю."
-        )
-
     except Exception:
         await message.answer(
-            f"Запись №{penalty_id} сохранена, "
-            "но бот не смог написать пользователю.\n"
-            "Пользователь должен самостоятельно запустить бота."
+            f"Решение №{saved_penalty_id} сохранено, "
+            "но уведомление участнику отправить не удалось. "
+            "Возможно, он ещё не запускал личный чат с ботом."
         )
+        return
+
+    await message.answer(
+        f"Решение №{saved_penalty_id} сохранено.\n"
+        f"Событие №{event_id} обработано.\n"
+        "Уведомление участнику отправлено."
+    )
+
+
+# ==========================================
+# ОТКЛОНЕНИЕ СОБЫТИЯ
+# ==========================================
+
+async def process_review_decision(
+    message: Message,
+    command: CommandObject,
+    decision_type: str,
+    decision_text: str,
+):
+    if not is_admin(message):
+        await message.answer("Нет доступа.")
+        return
+
+    if not command.args:
+        await message.answer("Укажи ID события.")
+        return
+
+    try:
+        event_id = int(command.args.strip())
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    async with Session() as session:
+        original = await session.scalar(
+            select(Event).where(
+                Event.id == event_id,
+                Event.chat_id == TARGET_CHAT_ID,
+                Event.event_type.in_(SUSPICIOUS_TYPES),
+            )
+        )
+
+        if original is None:
+            await message.answer("Событие не найдено.")
+            return
+
+        existing = await get_review_decision(session, event_id)
+
+        if existing is not None:
+            await message.answer("Событие уже рассмотрено.")
+            return
+
+        session.add(
+            Event(
+                chat_id=TARGET_CHAT_ID,
+                user_id=message.from_user.id,
+                message_id=original.message_id,
+                event_type=decision_type,
+                details=f"event_id={event_id}",
+            )
+        )
+
+        await session.commit()
+
+    await message.answer(
+        f"{decision_text}. ID события: {event_id}.\n"
+        "Наказание не применялось."
+    )
+
+
+@dp.message(Command("dismiss"), F.chat.type == "private")
+async def dismiss(message: Message, command: CommandObject):
+    await process_review_decision(
+        message,
+        command,
+        "review_dismissed",
+        "Подозрение отклонено",
+    )
 
 
 # ==========================================
@@ -666,7 +1096,6 @@ async def issue_penalty(
 
 @dp.message(Command("id"))
 async def show_id(message: Message):
-
     user_id = (
         message.from_user.id
         if message.from_user
@@ -685,7 +1114,6 @@ async def show_id(message: Message):
 
 @dp.message(Command("panel"), F.chat.type == "private")
 async def panel(message: Message):
-
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
@@ -695,14 +1123,15 @@ async def panel(message: Message):
         "/stats — статистика\n"
         "/events — последние события\n"
         "/review — очередь проверки\n"
-        "/confirm ID — подтвердить подозрение\n"
+        "/confirm ID — открыть выбор решения\n"
+        "/apply ID TYPE СРОК — применить решение\n"
         "/dismiss ID — отклонить подозрение\n"
         "/rules — список правил\n"
         "/rule ID — подробности правила\n"
-        "/penalty USER_ID RULE TYPE DAYS — запись наказания\n"
         "/answer ID ТЕКСТ — ответить на обращение\n"
         "/id — узнать ID\n\n"
-        "Автоматические наказания отключены.",
+        "Автоматические наказания отключены."
+        ,
         reply_markup=admin_menu()
     )
 
@@ -713,13 +1142,11 @@ async def panel(message: Message):
 
 @dp.message(Command("stats"), F.chat.type == "private")
 async def stats(message: Message):
-
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
 
     async with Session() as session:
-
         total = await session.scalar(
             select(func.count(Event.id)).where(
                 Event.chat_id == TARGET_CHAT_ID
@@ -749,6 +1176,12 @@ async def stats(message: Message):
                 )
             )
 
+        penalty_count = await session.scalar(
+            select(func.count(Penalty.id)).where(
+                Penalty.chat_id == TARGET_CHAT_ID
+            )
+        )
+
     await message.answer(
         "СТАТИСТИКА «СОЗВЕЗДИЯ»\n\n"
         f"Событий: {total or 0}\n"
@@ -758,7 +1191,8 @@ async def stats(message: Message):
         f"CAPS: {counts['caps_suspected'] or 0}\n\n"
         f"Подтверждено: {counts['review_confirmed'] or 0}\n"
         f"Отклонено: {counts['review_dismissed'] or 0}\n"
-        f"Записей о наказаниях: {counts['penalty'] or 0}\n"
+        f"Старых записей о наказаниях: {counts['penalty'] or 0}\n"
+        f"Новых решений: {penalty_count or 0}"
     )
 
 
@@ -768,13 +1202,11 @@ async def stats(message: Message):
 
 @dp.message(Command("events"), F.chat.type == "private")
 async def events(message: Message):
-
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
 
     async with Session() as session:
-
         result = await session.scalars(
             select(Event)
             .where(Event.chat_id == TARGET_CHAT_ID)
@@ -807,15 +1239,13 @@ async def events(message: Message):
 
 @dp.message(Command("review"), F.chat.type == "private")
 async def review(message: Message):
-
     if not is_admin(message):
         await message.answer("Нет доступа.")
         return
 
     async with Session() as session:
-
         decisions = await session.scalars(
-            select(Event.details).where(
+            select(Event).where(
                 Event.chat_id == TARGET_CHAT_ID,
                 Event.event_type.in_(REVIEW_TYPES)
             )
@@ -823,14 +1253,17 @@ async def review(message: Message):
 
         reviewed_ids = set()
 
-        for detail in decisions.all():
-            if detail and detail.startswith("event_id="):
-                try:
-                    reviewed_ids.add(
-                        int(detail.split("=", 1)[1])
-                    )
-                except ValueError:
-                    continue
+        for decision in decisions.all():
+            if not decision.details:
+                continue
+
+            match = re.search(
+                r"(?:^|[; ])event_id=(\d+)",
+                decision.details
+            )
+
+            if match:
+                reviewed_ids.add(int(match.group(1)))
 
         result = await session.scalars(
             select(Event)
@@ -865,146 +1298,6 @@ async def review(message: Message):
     await message.answer("\n".join(lines))
 
 
-async def process_review_decision(
-    message: Message,
-    command: CommandObject,
-    decision_type: str,
-    decision_text: str,
-):
-
-    if not is_admin(message):
-        await message.answer("Нет доступа.")
-        return
-
-    if not command.args:
-        await message.answer("Укажи ID события.")
-        return
-
-    try:
-        event_id = int(command.args.strip())
-    except ValueError:
-        await message.answer("ID должен быть числом.")
-        return
-
-    async with Session() as session:
-
-        original = await session.scalar(
-            select(Event).where(
-                Event.id == event_id,
-                Event.chat_id == TARGET_CHAT_ID,
-                Event.event_type.in_(SUSPICIOUS_TYPES)
-            )
-        )
-
-        if original is None:
-            await message.answer("Событие не найдено.")
-            return
-
-        existing = await session.scalar(
-            select(Event.id).where(
-                Event.chat_id == TARGET_CHAT_ID,
-                Event.event_type.in_(REVIEW_TYPES),
-                Event.details == f"event_id={event_id}"
-            ).limit(1)
-        )
-
-        if existing is not None:
-            await message.answer("Событие уже рассмотрено.")
-            return
-
-        session.add(
-            Event(
-                chat_id=TARGET_CHAT_ID,
-                user_id=message.from_user.id,
-                message_id=original.message_id,
-                event_type=decision_type,
-                details=f"event_id={event_id}"
-            )
-        )
-
-        await session.commit()
-
-    await message.answer(
-        f"{decision_text}. ID события: {event_id}.\n"
-        "Наказания не применялись."
-    )
-
-
-@dp.message(Command("confirm"))
-async def confirm_event(message: Message, command: CommandObject):
-    if not await is_admin(message):
-        return
-
-    if not command.args:
-        await message.answer("Использование: /confirm ID_СОБЫТИЯ")
-        return
-
-    try:
-        event_id = int(command.args.strip())
-    except ValueError:
-        await message.answer("ID события должен быть числом.")
-        return
-
-    async with Session() as session:
-        event = await session.get(Event, event_id)
-
-        if not event:
-            await message.answer("Событие не найдено.")
-            return
-
-        rule_id = EVENT_RULES.get(event.event_type)
-
-        if not rule_id:
-            await message.answer(
-                "Для этого типа события пока нет доступного выбора наказания."
-            )
-            return
-
-        existing = await session.scalar(
-            select(Event).where(
-                Event.event_type == "review_confirmed",
-                Event.details.contains(f"event_id={event_id}")
-            )
-        )
-
-        if existing:
-            await message.answer("Это событие уже подтверждено.")
-            return
-
-        dismissed = await session.scalar(
-            select(Event).where(
-                Event.event_type == "review_dismissed",
-                Event.details.contains(f"event_id={event_id}")
-            )
-        )
-
-        if dismissed:
-            await message.answer("Это событие уже отклонено.")
-            return
-
-        options = get_penalty_options(rule_id)
-
-        if not options:
-            await message.answer("Для правила нет вариантов наказания.")
-            return
-
-        await message.answer(
-            f"Событие #{event_id}\n"
-            f"Правило: {rule_id}\n"
-            "Выбери вариант решения:",
-            reply_markup=penalty_keyboard(event_id, rule_id)
-        )
-
-
-@dp.message(Command("dismiss"), F.chat.type == "private")
-async def dismiss(message: Message, command: CommandObject):
-    await process_review_decision(
-        message, command,
-        "review_dismissed",
-        "Подозрение отклонено"
-    )
-
-
 # ==========================================
 # КНОПКИ АДМИНИСТРАТОРА
 # ==========================================
@@ -1014,6 +1307,7 @@ async def admin_stats_button(callback: CallbackQuery):
     if not is_admin_id(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
+
     await callback.message.answer("Используй /stats.")
     await callback.answer()
 
@@ -1023,6 +1317,7 @@ async def admin_events_button(callback: CallbackQuery):
     if not is_admin_id(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
+
     await callback.message.answer("Используй /events.")
     await callback.answer()
 
@@ -1032,6 +1327,7 @@ async def admin_review_button(callback: CallbackQuery):
     if not is_admin_id(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
+
     await callback.message.answer("Используй /review.")
     await callback.answer()
 
@@ -1042,7 +1338,6 @@ async def admin_review_button(callback: CallbackQuery):
 
 @dp.message()
 async def observe(message: Message):
-
     if (
         message.chat.id != TARGET_CHAT_ID
         or not message.from_user
@@ -1051,11 +1346,10 @@ async def observe(message: Message):
         return
 
     user_id = message.from_user.id
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     text = message.text or message.caption or ""
 
     async with Session() as session:
-
         session.add(
             Event(
                 chat_id=TARGET_CHAT_ID,
@@ -1068,7 +1362,7 @@ async def observe(message: Message):
 
         await session.commit()
 
-        # Флуд — только подозрение для проверки.
+        # Флуд — только подозрение для ручной проверки.
         flood_cutoff = now - timedelta(
             seconds=FLOOD_WINDOW_SECONDS
         )
@@ -1083,7 +1377,6 @@ async def observe(message: Message):
         )
 
         if recent_count >= FLOOD_LIMIT:
-
             previous = await session.scalar(
                 select(Event.id).where(
                     Event.chat_id == TARGET_CHAT_ID,
@@ -1109,10 +1402,8 @@ async def observe(message: Message):
                 )
 
         if text and not text.lstrip().startswith("/"):
-
             # Спам
             if is_spam_suspected(user_id, text):
-
                 spam_cutoff = now - timedelta(
                     seconds=SPAM_WINDOW_SECONDS
                 )
@@ -1141,7 +1432,7 @@ async def observe(message: Message):
                         )
                     )
 
-            # CAPS
+            # CAPS: 5 сообщений за 2 минуты.
             history = caps_history[user_id]
 
             if is_caps_message(text):
@@ -1157,7 +1448,6 @@ async def observe(message: Message):
                 history.popleft()
 
             if len(history) >= CAPS_LIMIT:
-
                 previous = await session.scalar(
                     select(Event.id).where(
                         Event.chat_id == TARGET_CHAT_ID,
@@ -1175,9 +1465,9 @@ async def observe(message: Message):
                             message_id=message.message_id,
                             event_type="caps_suspected",
                             details=(
-                                "3+ CAPS-сообщения за 2 минуты. "
-                                "Нужна проверка, действительно ли "
-                                "это мешает общению."
+                                f"{CAPS_LIMIT}+ CAPS-сообщений за "
+                                f"{CAPS_WINDOW_SECONDS // 60} минуты. "
+                                "Нужна проверка контекста."
                             )
                         )
                     )

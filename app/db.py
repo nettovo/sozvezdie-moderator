@@ -1,4 +1,3 @@
-
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -32,7 +31,7 @@ class Base(DeclarativeBase):
     pass
 
 
-# Журнал событий. Существующую таблицу сохраняем.
+# Журнал событий.
 class Event(Base):
     __tablename__ = "events"
 
@@ -51,7 +50,7 @@ class Event(Base):
     )
 
 
-# Старая таблица апелляций. Оставляем для совместимости.
+# Старая таблица апелляций.
 class Appeal(Base):
     __tablename__ = "appeals"
 
@@ -69,7 +68,7 @@ class Appeal(Base):
     )
 
 
-# Отдельная запись о решении администрации.
+# Решения администрации о наказаниях.
 class Penalty(Base):
     __tablename__ = "penalties"
 
@@ -78,7 +77,6 @@ class Penalty(Base):
     chat_id: Mapped[int] = mapped_column(Integer, index=True)
     user_id: Mapped[int] = mapped_column(Integer, index=True)
 
-    # При наличии связываем решение с событием из журнала.
     event_id: Mapped[int | None] = mapped_column(
         ForeignKey("events.id"),
         nullable=True,
@@ -88,7 +86,6 @@ class Penalty(Base):
     rule_id: Mapped[str] = mapped_column(String(20))
     penalty_type: Mapped[str] = mapped_column(String(30))
 
-    # Например: "3 дня" или "30 минут".
     duration_text: Mapped[str] = mapped_column(
         String(100),
         default="",
@@ -101,7 +98,6 @@ class Penalty(Base):
 
     reason: Mapped[str] = mapped_column(Text, default="")
 
-    # issued — решение вынесено; cancelled — отменено.
     status: Mapped[str] = mapped_column(
         String(30),
         default="issued",
@@ -121,7 +117,7 @@ class Penalty(Base):
     )
 
 
-# Апелляция, связанная с конкретным наказанием.
+# Апелляция по конкретному наказанию.
 class ModerationAppeal(Base):
     __tablename__ = "moderation_appeals"
 
@@ -183,12 +179,29 @@ class AppealMessage(Base):
 
     sender_id: Mapped[int] = mapped_column(Integer)
 
-    # user или admin.
     sender_role: Mapped[str] = mapped_column(String(20))
 
     text: Mapped[str] = mapped_column(Text)
 
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+    )
+
+
+# Фиксация принятия правил пользователем.
+class RuleAcceptance(Base):
+    __tablename__ = "rule_acceptances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        unique=True,
+        index=True,
+    )
+
+    accepted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,
     )

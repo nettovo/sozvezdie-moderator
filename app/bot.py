@@ -278,9 +278,9 @@ async def contact_admin(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.message(F.chat.type == "private")
+@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def receive_appeal(message: Message):
-
+    
     if not message.from_user:
         return
 
